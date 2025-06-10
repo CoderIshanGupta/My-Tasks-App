@@ -1,10 +1,10 @@
+import { Entypo, FontAwesome5, MaterialIcons } from '@expo/vector-icons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Notifications from 'expo-notifications';
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Button,
   FlatList,
-  Modal,
   StyleSheet,
   Text,
   TextInput,
@@ -13,12 +13,14 @@ import {
 } from 'react-native';
 
 type Priority = 'High' | 'Medium' | 'Low';
+type SortOption = 'priority' | 'completed' | 'reminder';
 
 type Task = {
   id: string;
   text: string;
-  completed: boolean;
   priority: Priority;
+  completed: boolean;
+  reminderSeconds: number;
   notificationId?: string;
 };
 
@@ -26,261 +28,320 @@ export default function App() {
   const [taskText, setTaskText] = useState('');
   const [tasks, setTasks] = useState<Task[]>([]);
   const [priority, setPriority] = useState<Priority>('Medium');
-  const [editingTask, setEditingTask] = useState<Task | null>(null);
-  const [modalVisible, setModalVisible] = useState(false);
-  const [recentlyDeletedTask, setRecentlyDeletedTask] = useState<Task | null>(null);
-  const [undoVisible, setUndoVisible] = useState(false);
+  const [reminderSeconds, setReminderSeconds] = useState(300);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [deletedTask, setDeletedTask] = useState<Task | null>(null);
   const undoTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const inputRef = useRef<TextInput>(null);
+  const [sortOption, setSortOption] = useState<SortOption>('priority');
+  const [filterPriority, setFilterPriority] = useState<'All' | Priority>('All');
+
+  const priorityOrder = { High: 1, Medium: 2, Low: 3 };
 
   useEffect(() => {
     (async () => {
       const { status } = await Notifications.requestPermissionsAsync();
       if (status !== 'granted') {
-        alert('Permission for notifications not granted.');
+        alert('Permission for notifications not granted');
       }
     })();
-
     loadTasks();
   }, []);
 
   const loadTasks = async () => {
-    const savedTasks = await AsyncStorage.getItem('tasks');
-    if (savedTasks) {
-      setTasks(JSON.parse(savedTasks));
-    }
+    const saved = await AsyncStorage.getItem('tasks');
+    if (saved) setTasks(JSON.parse(saved));
   };
 
-  const saveTasks = async (tasksToSave: Task[]) => {
-    await AsyncStorage.setItem('tasks', JSON.stringify(tasksToSave));
+  const saveTasks = async (newTasks: Task[]) => {
+    await AsyncStorage.setItem('tasks', JSON.stringify(newTasks));
   };
 
   const scheduleNotification = async (task: Task) => {
     try {
-      const notificationId = await Notifications.scheduleNotificationAsync({
+      const id = await Notifications.scheduleNotificationAsync({
         content: {
           title: 'Task Reminder',
-          body: `Time to complete: ${task.text}`,
+          body: `Don't forget: ${task.text}`,
         },
         trigger: {
-          seconds: 300,
+          type: 'timeInterval',
+          seconds: task.reminderSeconds,
           repeats: false,
-        } as any,
+        } as const as Notifications.NotificationTriggerInput,
       });
-      return notificationId;
-    } catch (error) {
-      console.error('Error scheduling notification:', error);
+
+      return id;
+    } catch (err) {
+      console.error('Notification scheduling error:', err);
+      return undefined;
     }
   };
 
-  const addTask = async () => {
+  const addOrUpdateTask = async () => {
     if (!taskText.trim()) {
       alert('Task cannot be empty');
       return;
     }
 
-    const newTask: Task = {
-      id: Date.now().toString(),
-      text: taskText,
-      completed: false,
-      priority,
-    };
+    if (editingId) {
+      const updatedTasks = tasks.map((task) =>
+        task.id === editingId
+          ? { ...task, text: taskText, priority, reminderSeconds }
+          : task
+      );
+      setTasks(updatedTasks);
+      await saveTasks(updatedTasks);
+      setEditingId(null);
+    } else {
+      const newTask: Task = {
+        id: Date.now().toString(),
+        text: taskText.trim(),
+        priority,
+        completed: false,
+        reminderSeconds,
+      };
+      const notificationId = await scheduleNotification(newTask);
+      if (notificationId) newTask.notificationId = notificationId;
 
-    const notificationId = await scheduleNotification(newTask);
-    newTask.notificationId = notificationId;
+      const updated = [newTask, ...tasks];
+      setTasks(updated);
+      await saveTasks(updated);
+    }
 
-    const updatedTasks = [newTask, ...tasks];
-    setTasks(updatedTasks);
-    saveTasks(updatedTasks);
     setTaskText('');
+    setReminderSeconds(300);
   };
 
   const toggleComplete = async (taskId: string) => {
-    const updated = tasks.map(task => {
-      if (task.id === taskId) {
-        if (!task.completed && task.notificationId) {
-          Notifications.cancelScheduledNotificationAsync(task.notificationId);
+    const updated = await Promise.all(
+      tasks.map(async (task) => {
+        if (task.id === taskId) {
+          if (!task.completed && task.notificationId) {
+            await Notifications.cancelScheduledNotificationAsync(task.notificationId);
+          }
+          return { ...task, completed: !task.completed, notificationId: undefined };
         }
-        return {
-          ...task,
-          completed: !task.completed,
-          notificationId: undefined,
-        };
-      }
-      return task;
-    });
+        return task;
+      })
+    );
     setTasks(updated);
-    saveTasks(updated);
+    await saveTasks(updated);
   };
 
   const deleteTask = async (taskId: string) => {
-    const taskToDelete = tasks.find(t => t.id === taskId);
+    const taskToDelete = tasks.find((t) => t.id === taskId);
     if (!taskToDelete) return;
-
     if (taskToDelete.notificationId) {
       await Notifications.cancelScheduledNotificationAsync(taskToDelete.notificationId);
     }
-
-    const updated = tasks.filter(t => t.id !== taskId);
+    setDeletedTask(taskToDelete);
+    const updated = tasks.filter((t) => t.id !== taskId);
     setTasks(updated);
-    saveTasks(updated);
-    setRecentlyDeletedTask(taskToDelete);
-    setUndoVisible(true);
-
+    await saveTasks(updated);
     if (undoTimer.current) clearTimeout(undoTimer.current);
-    undoTimer.current = setTimeout(() => {
-      setUndoVisible(false);
-      setRecentlyDeletedTask(null);
-    }, 5000);
+    undoTimer.current = setTimeout(() => setDeletedTask(null), 5000);
   };
 
-  const undoDelete = () => {
-    if (!recentlyDeletedTask) return;
-    const updatedTasks = [recentlyDeletedTask, ...tasks];
-    setTasks(updatedTasks);
-    saveTasks(updatedTasks);
-    setUndoVisible(false);
-    setRecentlyDeletedTask(null);
-    if (undoTimer.current) clearTimeout(undoTimer.current);
+  const undoDelete = async () => {
+    if (deletedTask) {
+      const updated = [deletedTask, ...tasks];
+      setTasks(updated);
+      await saveTasks(updated);
+      setDeletedTask(null);
+      if (undoTimer.current) clearTimeout(undoTimer.current);
+    }
   };
 
-  const editTask = (task: Task) => {
-    setEditingTask(task);
+  const startEdit = (task: Task) => {
+    setEditingId(task.id);
     setTaskText(task.text);
     setPriority(task.priority);
-    setModalVisible(true);
-    inputRef.current?.focus();
+    setReminderSeconds(task.reminderSeconds);
   };
 
-  const saveEditedTask = () => {
-    if (!editingTask) return;
+  const displayedTasks = useMemo(() => {
+    let filtered = tasks;
+    if (filterPriority !== 'All') {
+      filtered = filtered.filter(t => t.priority === filterPriority);
+    }
 
-    const updated = tasks.map(t =>
-      t.id === editingTask.id
-        ? { ...t, text: taskText, priority }
-        : t
-    );
+    let sorted = [...filtered];
+    if (sortOption === 'priority') {
+      sorted.sort((a, b) => priorityOrder[a.priority] - priorityOrder[b.priority]);
+    } else if (sortOption === 'completed') {
+      sorted.sort((a, b) => Number(a.completed) - Number(b.completed));
+    } else if (sortOption === 'reminder') {
+      sorted.sort((a, b) => a.reminderSeconds - b.reminderSeconds);
+    }
 
-    setTasks(updated);
-    saveTasks(updated);
-    setEditingTask(null);
-    setTaskText('');
-    setModalVisible(false);
-  };
-
-  const cancelEdit = () => {
-    setEditingTask(null);
-    setTaskText('');
-    setModalVisible(false);
-  };
+    return sorted;
+  }, [tasks, filterPriority, sortOption]);
 
   return (
     <View style={styles.container}>
-      <Text style={styles.header}>My Tasks</Text>
+      <Text style={styles.header}>📝 Task Manager</Text>
 
       <View style={styles.inputContainer}>
         <TextInput
-          ref={inputRef}
           placeholder="Enter task"
           value={taskText}
           onChangeText={setTaskText}
           style={styles.input}
+          placeholderTextColor="#999"
         />
+        <TextInput
+          placeholder="Reminder (in sec)"
+          value={reminderSeconds === 0 ? '' : reminderSeconds.toString()}
+          keyboardType="numeric"
+          onChangeText={(v) => setReminderSeconds(Number(v) || 0)}
+          style={styles.input}
+          placeholderTextColor="#999"
+
+        />
+
         <View style={styles.priorityButtons}>
-          {(['High', 'Medium', 'Low'] as Priority[]).map(p => (
+          {(['High', 'Medium', 'Low'] as Priority[]).map((p) => (
             <TouchableOpacity
               key={p}
               onPress={() => setPriority(p)}
               style={[
                 styles.priorityButton,
+                p === 'High' && styles.priorityHigh,
+                p === 'Medium' && styles.priorityMedium,
+                p === 'Low' && styles.priorityLow,
                 priority === p && styles.priorityButtonSelected,
               ]}
             >
-              <Text>{p}</Text>
+              <Text
+                style={[
+                  styles.priorityText,
+                  priority === p && styles.priorityTextSelected,
+                ]}
+              >
+                {p}
+              </Text>
             </TouchableOpacity>
           ))}
         </View>
+
         <Button
-          title={editingTask ? 'Save Changes' : 'Add Task'}
-          onPress={editingTask ? saveEditedTask : addTask}
+          title={editingId ? 'Update Task' : 'Add Task'}
+          onPress={addOrUpdateTask}
+          disabled={!taskText.trim()}
         />
-        {editingTask && <Button title="Cancel" onPress={cancelEdit} color="orange" />}
       </View>
 
+      <View style={styles.sortFilterContainer}>
+        <View style={styles.sortFilterGroup}>
+          <Text style={styles.sortFilterLabel}>Sort by:</Text>
+          {(['priority', 'completed', 'reminder'] as SortOption[]).map(opt => (
+            <TouchableOpacity
+              key={opt}
+              onPress={() => setSortOption(opt)}
+              style={[
+                styles.sortFilterButton,
+                sortOption === opt && styles.sortFilterButtonSelected,
+              ]}
+            >
+              <Text style={[
+                styles.sortFilterText,
+                sortOption === opt && styles.sortFilterTextSelected
+              ]}>
+                {opt.charAt(0).toUpperCase() + opt.slice(1)}
+              </Text>
+            </TouchableOpacity>
+          ))}
+        </View>
+
+        <View style={styles.sortFilterGroup}>
+          <Text style={styles.sortFilterLabel}>Filter Priority:</Text>
+          {(['All', 'High', 'Medium', 'Low'] as ('All' | Priority)[]).map(p => (
+            <TouchableOpacity
+              key={p}
+              onPress={() => setFilterPriority(p)}
+              style={[
+                styles.sortFilterButton,
+                filterPriority === p && styles.sortFilterButtonSelected,
+              ]}
+            >
+              <Text style={[
+                styles.sortFilterText,
+                filterPriority === p && styles.sortFilterTextSelected
+              ]}>
+                {p}
+              </Text>
+            </TouchableOpacity>
+          ))}
+        </View>
+      </View>
+
+      {deletedTask && (
+        <TouchableOpacity onPress={undoDelete} style={styles.undoContainer}>
+          <Text style={styles.undoText}>Undo delete</Text>
+        </TouchableOpacity>
+      )}
+
       <FlatList
-        data={tasks}
-        keyExtractor={item => item.id}
+        data={displayedTasks}
+        keyExtractor={(item) => item.id}
         renderItem={({ item }) => (
-          <View style={styles.taskContainer}>
+          <View style={styles.taskCard}>
             <View style={{ flex: 1 }}>
-              <Text style={[styles.taskText, item.completed && styles.completedTask]}>
+              <Text style={[styles.taskText, item.completed && styles.completed]}>
                 {item.text}
               </Text>
-              <Text style={styles.priorityText}>Priority: {item.priority}</Text>
-              {item.completed && <Text style={styles.completedLabel}>✅ Completed</Text>}
+              <Text style={styles.meta}>Priority: {item.priority}</Text>
+              <Text style={styles.meta}>
+                Reminder in: {item.reminderSeconds} sec
+              </Text>
+              {item.completed && (
+                <Text style={styles.completedLabel}>✅ Completed</Text>
+              )}
             </View>
-            <View style={styles.buttons}>
-              <Button
-                title={item.completed ? 'Undo' : 'Mark Complete'}
+            <View style={styles.actions}>
+              <TouchableOpacity
+                style={[styles.actionButton, styles.completeButton]}
                 onPress={() => toggleComplete(item.id)}
-                color={item.completed ? '#ff9800' : '#4caf50'}
-              />
-              <View style={{ width: 10 }} />
-              <Button title="Edit" onPress={() => editTask(item)} />
-              <View style={{ width: 10 }} />
-              <Button title="Delete" onPress={() => deleteTask(item.id)} color="red" />
+                activeOpacity={0.7}
+              >
+                <MaterialIcons
+                  name={item.completed ? 'undo' : 'check-circle'}
+                  size={20}
+                  color="#fff"
+                />
+                <Text style={styles.actionButtonText}>
+                  {item.completed ? 'Undo' : 'Complete'}
+                </Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={[styles.actionButton, styles.editButton]}
+                onPress={() => startEdit(item)}
+                activeOpacity={0.7}
+              >
+                <FontAwesome5 name="edit" size={18} color="#fff" />
+                <Text style={styles.actionButtonText}>Edit</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={[styles.actionButton, styles.deleteButton]}
+                onPress={() => deleteTask(item.id)}
+                activeOpacity={0.7}
+              >
+                <Entypo name="trash" size={18} color="#fff" />
+                <Text style={styles.actionButtonText}>Delete</Text>
+              </TouchableOpacity>
             </View>
           </View>
         )}
       />
-
-      {/* Undo Snackbar */}
-      {undoVisible && recentlyDeletedTask && (
-        <View style={styles.undoContainer}>
-          <Text style={styles.undoText}>Task deleted</Text>
-          <TouchableOpacity onPress={undoDelete}>
-            <Text style={styles.undoButton}>UNDO</Text>
-          </TouchableOpacity>
-        </View>
-      )}
-
-      {/* Modal for Editing */}
-      <Modal visible={modalVisible} animationType="slide" transparent>
-        <View style={styles.modalOverlay}>
-          <View style={styles.modalContent}>
-            <Text>Edit Task</Text>
-            <TextInput
-              ref={inputRef}
-              style={styles.input}
-              value={taskText}
-              onChangeText={setTaskText}
-            />
-            <View style={styles.priorityButtons}>
-              {(['High', 'Medium', 'Low'] as Priority[]).map(p => (
-                <TouchableOpacity
-                  key={p}
-                  onPress={() => setPriority(p)}
-                  style={[
-                    styles.priorityButton,
-                    priority === p && styles.priorityButtonSelected,
-                  ]}
-                >
-                  <Text>{p}</Text>
-                </TouchableOpacity>
-              ))}
-            </View>
-            <Button title="Save" onPress={saveEditedTask} />
-            <Button title="Cancel" onPress={cancelEdit} color="gray" />
-          </View>
-        </View>
-      </Modal>
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, padding: 20, paddingTop: 50, backgroundColor: '#f9f9f9' },
-  header: { fontSize: 24, fontWeight: 'bold', marginBottom: 20 },
+  container: { flex: 1, padding: 20, backgroundColor: '#f0f0f0' },
+  header: { fontSize: 26, fontWeight: 'bold', marginBottom: 20, textAlign: 'center' },
   inputContainer: { marginBottom: 20 },
   input: {
     borderWidth: 1,
@@ -289,22 +350,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 10,
     height: 40,
     marginBottom: 10,
-  },
-  taskContainer: {
-    flexDirection: 'column',
     backgroundColor: '#fff',
-    padding: 12,
-    borderRadius: 5,
-    marginBottom: 10,
-  },
-  taskText: { fontSize: 16 },
-  completedTask: { textDecorationLine: 'line-through', color: 'gray' },
-  completedLabel: { fontSize: 12, color: 'green', marginTop: 4, fontWeight: '600' },
-  buttons: {
-    flexDirection: 'row',
-    marginTop: 10,
-    justifyContent: 'flex-start',
-    alignItems: 'center',
   },
   priorityButtons: {
     flexDirection: 'row',
@@ -312,42 +358,121 @@ const styles = StyleSheet.create({
     marginBottom: 10,
   },
   priorityButton: {
-    padding: 8,
-    borderRadius: 5,
-    backgroundColor: '#eee',
-    marginRight: 5,
-  },
-  priorityButtonSelected: {
-    backgroundColor: '#cde1f9',
-  },
-  priorityText: {
-    fontSize: 12,
-    color: '#666',
-    marginTop: 4,
-  },
-  modalOverlay: {
     flex: 1,
-    justifyContent: 'center',
-    backgroundColor: '#00000099',
-    padding: 20,
-  },
-  modalContent: {
-    backgroundColor: '#fff',
-    borderRadius: 10,
-    padding: 20,
-  },
-  undoContainer: {
-    position: 'absolute',
-    bottom: 20,
-    left: 20,
-    right: 20,
-    padding: 12,
-    backgroundColor: '#333',
-    borderRadius: 8,
-    flexDirection: 'row',
-    justifyContent: 'space-between',
+    marginHorizontal: 4,
+    paddingVertical: 10,
+    borderRadius: 5,
+    borderWidth: 1,
     alignItems: 'center',
   },
-  undoText: { color: '#fff' },
-  undoButton: { color: '#4caf50', fontWeight: 'bold' },
+  priorityHigh: {
+    backgroundColor: '#ffcdd2',
+    borderColor: '#d32f2f',
+  },
+  priorityMedium: {
+    backgroundColor: '#fff9c4',
+    borderColor: '#fbc02d',
+  },
+  priorityLow: {
+    backgroundColor: '#c8e6c9',
+    borderColor: '#388e3c',
+  },
+  priorityButtonSelected: {
+    backgroundColor: '#2196f3',
+    borderColor: '#1976d2',
+  },
+  priorityText: {
+    color: '#555',
+    fontWeight: '600',
+  },
+  priorityTextSelected: {
+    color: '#fff',
+  },
+  undoContainer: {
+    backgroundColor: '#2196f3',
+    marginBottom: 10,
+    paddingVertical: 8,
+    borderRadius: 6,
+  },
+  undoText: {
+    color: 'white',
+    textAlign: 'center',
+    fontWeight: 'bold',
+    fontSize: 16,
+  },
+  taskCard: {
+    backgroundColor: '#fff',
+    padding: 12,
+    borderRadius: 8,
+    marginBottom: 10,
+    elevation: 2,
+  },
+  taskText: { fontSize: 16 },
+  completed: { textDecorationLine: 'line-through', color: 'gray' },
+  completedLabel: {
+    fontSize: 12,
+    color: 'green',
+    marginTop: 4,
+    fontWeight: '600',
+  },
+  meta: { fontSize: 12, color: '#555' },
+  actions: {
+    flexDirection: 'row',
+    justifyContent: 'space-around',
+    marginTop: 10,
+  },
+  actionButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+    borderRadius: 20,
+  },
+  actionButtonText: {
+    color: '#fff',
+    fontWeight: '600',
+    marginLeft: 6,
+  },
+  completeButton: {
+    backgroundColor: '#4caf50',
+  },
+  editButton: {
+    backgroundColor: '#2196f3',
+  },
+  deleteButton: {
+    backgroundColor: '#f44336',
+  },
+  sortFilterContainer: {
+    marginBottom: 10,
+  },
+  sortFilterGroup: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flexWrap: 'wrap',
+    marginVertical: 5,
+  },
+  sortFilterLabel: {
+    marginRight: 10,
+    fontWeight: '600',
+  },
+  sortFilterButton: {
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 15,
+    borderWidth: 1,
+    borderColor: '#aaa',
+    marginHorizontal: 4,
+    marginVertical: 2,
+  },
+  sortFilterButtonSelected: {
+    backgroundColor: '#2196f3',
+    borderColor: '#1976d2',
+  },
+  sortFilterText: {
+    color: '#555',
+    fontWeight: '600',
+  },
+  sortFilterTextSelected: {
+    color: '#fff',
+  },
 });
